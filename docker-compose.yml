@@ -1,0 +1,181 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: maintenance
+      POSTGRES_USER: maintenance
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-maintenance_demo}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U maintenance -d maintenance"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  chroma:
+    image: chromadb/chroma:0.5.23
+    environment:
+      IS_PERSISTENT: "TRUE"
+      PERSIST_DIRECTORY: /chroma/chroma
+      ANONYMIZED_TELEMETRY: "FALSE"
+    volumes:
+      - chroma_data:/chroma/chroma
+    ports:
+      - "8001:8000"
+    restart: unless-stopped
+
+  api:
+    build: .
+    command:
+      - uvicorn
+      - api:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --workers
+      - "1"
+    environment:
+      DATABASE_URL: postgresql+psycopg://maintenance:${POSTGRES_PASSWORD:-maintenance_demo}@postgres:5432/maintenance
+      CSV_PATH: /app/data/banner.csv
+      ARTIFACT_PATH: /app/artifacts/similarity.joblib
+      CHROMA_HOST: chroma
+      CHROMA_PORT: "8000"
+      CHROMA_COLLECTION: maintenance_manuals_v2
+      EMBEDDING_MODEL: sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
+      EMBEDDING_DEVICE: cpu
+      RAG_MIN_SIMILARITY: "0.42"
+      OLLAMA_BASE_URL: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-llama3.1:8b}
+      ALLOW_CLOUD: ${ALLOW_CLOUD:-false}
+      CLOUD_API_KEY: ${CLOUD_API_KEY:-}
+      DEMO_ADMIN_TOKEN: ${DEMO_ADMIN_TOKEN:-change-me}
+      ENABLE_DEMO_ENDPOINTS: "true"
+      HF_HOME: /models/huggingface
+    volumes:
+      - ./data:/app/data:ro
+      - artifacts:/app/artifacts
+      - huggingface_cache:/models/huggingface
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      chroma:
+        condition: service_started
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  frontend:
+    build: .
+    command:
+      - streamlit
+      - run
+      - streamlit_app.py
+      - --server.address=0.0.0.0
+      - --server.port=8501
+    environment:
+      API_URL: http://api:8000
+    ports:
+      - "8501:8501"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    volumes:
+      - ./mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto_data:/mosquitto/data
+    ports:
+      - "1883:1883"
+    restart: unless-stopped
+
+  mqtt-bridge:
+    build: .
+    command: ["python", "mqtt_bridge.py"]
+    environment:
+      API_URL: http://api:8000
+      MQTT_HOST: mosquitto
+      MQTT_TOPIC: factory/telemetry/machine_01
+      MQTT_RESULT_TOPIC: factory/diagnosis/machine_01
+      LLM_PROVIDER: ${LLM_PROVIDER:-none}
+      HYSTERESIS_WINDOW: "5"
+      HYSTERESIS_MIN_VOTES: "3"
+      HYSTERESIS_DOMINANCE: "0.60"
+      PRESCRIPTION_COOLDOWN_SECONDS: "300"
+    depends_on:
+      api:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+
+  mqtt-simulator:
+    build: .
+    command: ["python", "mqtt_simulator.py"]
+    environment:
+      API_URL: http://api:8000
+      MQTT_HOST: mosquitto
+      MQTT_TOPIC: factory/telemetry/machine_01
+      MACHINE_ID: machine_01
+      INTERVAL_SECONDS: "2"
+    depends_on:
+      api:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:0.3.14
+    profiles: ["gpu"]
+    gpus: all
+    volumes:
+      - ollama_data:/root/.ollama
+    ports:
+      - "11434:11434"
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+    restart: unless-stopped
+
+  ollama-pull:
+    image: ollama/ollama:0.3.14
+    profiles: ["gpu"]
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        until ollama list >/dev/null 2>&1; do sleep 2; done
+        ollama pull ${OLLAMA_MODEL:-llama3.1:8b}
+    depends_on:
+      ollama:
+        condition: service_healthy
+    volumes:
+      - ollama_data:/root/.ollama
+    restart: "no"
+
+volumes:
+  postgres_data:
+  chroma_data:
+  artifacts:
+  huggingface_cache:
+  mosquitto_data:
+  ollama_data:
